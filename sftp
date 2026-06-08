@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""
+SFTP incremental downloader for Windows Server.
+
+What it does:
+  * Connects to an SFTP server using password authentication.
+  * Downloads ONLY files that are new or that changed on the server.
+  * For files already downloaded, verifies local integrity via SHA-256.
+  * Sends an email notification for every file it downloads.
+  * Logs everything to a rotating log file and the console.
+
+State is tracked in a JSON manifest (remote filename -> checksum/size/mtime),
+so the script is safe to run repeatedly (e.g. from Windows Task Scheduler).
+
+A note on checksums: standard SFTP does not expose a reliable remote checksum,
+so "did the remote change?" is decided by size + modification time, and the
+SHA-256 is computed locally after download to (a) record integrity and
+(b) detect later corruption of the local copy.
+"""
+
+import hashlib
+import json
+import logging
+import socket
+import stat
+import sys
+from datetime import datetime
+from email.message import EmailMessage
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+import smtplib
+
+import paramiko
+
+# ---------------------------------------------------------------------------
+# CONFIG  -- edit these for your environment
+# ---------------------------------------------------------------------------
+
+# --- SFTP connection ---
+SFTP_HOST = "sftp.example.com"
+SFTP_PORT = 22
+SFTP_USERNAME = "sftpuser"
+SFTP_PASSWORD = "your_password_here"      # or: os.environ["SFTP_PASS"]
+SFTP_TIMEOUT = 30                         # seconds
+
+# --- Directories (raw strings for Windows paths) ---
+REMOTE_DIR = "/remote/upload"
+LOCAL_DIR = Path(r"C:\data\downloads")
+
+# --- State + logs ---
+MANIFEST_FILE = Path(r"C:\data\sftp_manifest.json")
+LOG_FILE = Path(r"C:\data\logs\sftp_download.log")
+LOG_MAX_BYTES = 5 * 1024 * 1024           # rotate at 5 MB
+LOG_BACKUP_COUNT = 5
+
+# --- Email (SMTP) ---
+EMAIL_ENABLED = True
+SMTP_HOST = "smtp.example.com"
+SMTP_PORT = 587
+SMTP_USE_TLS = True
+SMTP_USERNAME = "alerts@example.com"
+SMTP_PASSWORD = "smtp_password_here"
+EMAIL_FROM = "alerts@example.com"
+EMAIL_TO = ["you@example.com"]            # one or more recipients
+
+# --- Host-key policy ---
+# Leave True for the first run so the key is recorded, then set False to
+# require a known, unchanged server key (protects against MITM).
+AUTO_ADD_HOST_KEY = True
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+def setup_logger() -> logging.Logger:
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("sftp_downloader")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    file_handler = RotatingFileHandler(
+        LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(fmt)
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(fmt)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    return logger
+
+
+log = setup_logger()
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def sha256_of(path: Path, chunk_size: int = 65536) -> str:
+    """SHA-256 hex digest of a local file, read in chunks (memory safe)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def load_manifest() -> dict:
+    if MANIFEST_FILE.exists():
+        try:
+            with open(MANIFEST_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            log.warning("Could not read manifest (%s); starting fresh.", exc)
+    return {}
+
+
+def save_manifest(manifest: dict) -> None:
+    """Write the manifest atomically so a crash can't corrupt it."""
+    MANIFEST_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = MANIFEST_FILE.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+    tmp.replace(MANIFEST_FILE)
+
+
+def send_email(subject: str, body: str) -> None:
+    """Send a notification. Never allowed to crash the download run."""
+    if not EMAIL_ENABLED:
+        return
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = EMAIL_FROM
+        msg["To"] = ", ".join(EMAIL_TO)
+        msg.set_content(body)
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+            if SMTP_USE_TLS:
+                server.starttls()
+            if SMTP_USERNAME:
+                server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.send_message(msg)
+        log.info("Email sent: %s", subject)
+    except Exception as exc:
+        log.error("Failed to send email '%s': %s", subject, exc)
+
+
+def download_file(sftp, remote_name: str, local_path: Path) -> str:
+    """Download a remote file atomically (.part -> rename) and return SHA-256."""
+    remote_path = f"{REMOTE_DIR}/{remote_name}"
+    part_path = local_path.with_suffix(local_path.suffix + ".part")
+
+    log.info("Downloading %s -> %s", remote_path, local_path)
+    sftp.get(remote_path, str(part_path))
+    part_path.replace(local_path)          # promote only on full success
+    return sha256_of(local_path)
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    log.info("=" * 60)
+    log.info("SFTP download run started")
+    LOCAL_DIR.mkdir(parents=True, exist_ok=True)
+
+    manifest = load_manifest()
+
+    ssh = paramiko.SSHClient()
+    ssh.load_system_host_keys()
+    if AUTO_ADD_HOST_KEY:
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    downloaded = skipped = failed = 0
+
+    try:
+        ssh.connect(
+            SFTP_HOST, port=SFTP_PORT, username=SFTP_USERNAME,
+            password=SFTP_PASSWORD, timeout=SFTP_TIMEOUT,
+        )
+        sftp = ssh.open_sftp()
+        log.info("Connected to %s as %s", SFTP_HOST, SFTP_USERNAME)
+        entries = sftp.listdir_attr(REMOTE_DIR)
+    except (paramiko.SSHException, socket.error, OSError) as exc:
+        log.error("Connection or listing failed: %s", exc)
+        send_email("SFTP download FAILED",
+                   f"Could not connect to or list {SFTP_HOST}:\n{exc}")
+        ssh.close()
+        return 1
+
+    for attr in entries:
+        name = attr.filename
+        if stat.S_ISDIR(attr.st_mode):     # skip subdirectories
+            continue
+
+        local_path = LOCAL_DIR / name
+        record = manifest.get(name)
+
+        # Decide whether this file needs downloading and why.
+        if record is None:
+            reason = "new file"
+        elif (record.get("size") != attr.st_size
+              or record.get("mtime") != int(attr.st_mtime)):
+            reason = "remote file changed"
+        elif not local_path.exists():
+            reason = "local copy missing"
+        else:
+            # Already downloaded, remote unchanged -> verify local checksum.
+            if sha256_of(local_path) != record.get("sha256"):
+                reason = "local checksum mismatch"
+            else:
+                log.info("Skipping %s (already downloaded, checksum OK)", name)
+                skipped += 1
+                continue
+
+        # Download (covers all reasons above).
+        try:
+            checksum = download_file(sftp, name, local_path)
+            manifest[name] = {
+                "sha256": checksum,
+                "size": attr.st_size,
+                "mtime": int(attr.st_mtime),
+                "downloaded_at": datetime.now().isoformat(timespec="seconds"),
+                "local_path": str(local_path),
+            }
+            save_manifest(manifest)        # persist after each file
+            downloaded += 1
+            log.info("Downloaded %s (%s); sha256=%s", name, reason, checksum)
+            send_email(
+                f"SFTP file downloaded: {name}",
+                f"File   : {name}\n"
+                f"Reason : {reason}\n"
+                f"Size   : {attr.st_size} bytes\n"
+                f"SHA-256: {checksum}\n"
+                f"Saved  : {local_path}\n"
+                f"Time   : {datetime.now().isoformat(timespec='seconds')}\n",
+            )
+        except Exception as exc:
+            failed += 1
+            log.error("Failed to download %s: %s", name, exc)
+            send_email(f"SFTP download error: {name}",
+                       f"Error downloading {name}:\n{exc}")
+
+    sftp.close()
+    ssh.close()
+    log.info("Run complete. downloaded=%d skipped=%d failed=%d",
+             downloaded, skipped, failed)
+    return 0 if failed == 0 else 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        log.exception("Unhandled error: %s", exc)
+        send_email("SFTP downloader crashed", f"Unhandled error:\n{exc}")
+        sys.exit(3)
