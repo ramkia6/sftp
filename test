@@ -1,0 +1,16 @@
+import paramiko, stat
+
+ssh = paramiko.SSHClient()
+ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+ssh.connect("sftp.example.com", port=22, username="sftpuser", password="your_password")
+sftp = ssh.open_sftp()
+
+print("Default dir after login:", sftp.normalize("."))
+
+target = "/remote/upload"          # your REMOTE_DIR
+print("Listing:", target)
+for a in sftp.listdir_attr(target):
+    kind = "DIR " if stat.S_ISDIR(a.st_mode) else "FILE"
+    print(f"  {kind} {a.filename}  ({a.st_size} bytes)")
+
+ssh.close()
