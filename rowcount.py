@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 import concurrent.futures as cf
 import logging
 import sys
@@ -31,11 +30,13 @@ POSTGRES_CONFIG = {
     "dbname":   "mydb",
 }
 
-SCHEMA_PAIRS = [
-    ("SALES",   "sales"),
-    ("HR",      "hr"),
-    ("FINANCE", "finance"),
-]
+# Oracle schemas to process. Postgres schema = lowercase of the Oracle name.
+# If a particular schema maps differently in Postgres, add to SCHEMA_OVERRIDES.
+SCHEMAS = ["SALES", "HR", "FINANCE"]
+
+SCHEMA_OVERRIDES: dict = {
+    # "ORACLE_NAME": "postgres_name",
+}
 
 MAX_WORKERS_PER_DB = 16
 POOL_SIZE = MAX_WORKERS_PER_DB
@@ -51,6 +52,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("rowcount")
 
+
+def pg_schema_for(ora_schema: str) -> str:
+    return SCHEMA_OVERRIDES.get(ora_schema, ora_schema.lower())
+
+
 # ----------------------------------------------------------------------------
 # Result model
 # ----------------------------------------------------------------------------
@@ -58,11 +64,11 @@ log = logging.getLogger("rowcount")
 class TableResult:
     oracle_schema: str
     pg_schema: str
-    table_name: str                  # display name (preferred case)
-    in_oracle: bool = False
-    in_postgres: bool = False
-    ora_table_actual: str = ""       # exact name as stored in Oracle catalog
-    pg_table_actual: str = ""        # exact name as stored in Postgres catalog
+    table_name: str                # Oracle name (display)
+    ora_table_actual: str = ""     # Oracle catalog name
+    pg_table_actual: str = ""      # Postgres name we tried (lowercase)
+    in_oracle: bool = True         # we drive from Oracle
+    in_postgres: bool = True       # optimistic; flipped if COUNT 42P01s
     oracle_count: Optional[int] = None
     pg_count: Optional[int] = None
     oracle_error: str = ""
@@ -118,32 +124,24 @@ class PostgresPool:
     def __init__(self, cfg, size):
         self.pool = pg_pool.ThreadedConnectionPool(minconn=2, maxconn=size, **cfg)
 
-    def _run(self, sql, params, fetch):
+    def query_one(self, sql, params=None):
         conn = self.pool.getconn()
         try:
             with conn.cursor() as cur:
                 cur.execute(sql, params)
-                return fetch(cur)
+                return cur.fetchone()
         finally:
             conn.rollback()
             self.pool.putconn(conn)
-
-    def query_one(self, sql, params=None):
-        return self._run(sql, params, lambda c: c.fetchone())
-
-    def query_all(self, sql, params=None):
-        return self._run(sql, params, lambda c: c.fetchall())
 
     def close(self):
         self.pool.closeall()
 
 
 # ----------------------------------------------------------------------------
-# Metadata fetchers -- query catalogs DIRECTLY, not privilege-filtered views
+# Oracle metadata (only side we list)
 # ----------------------------------------------------------------------------
-def get_oracle_tables(orapool: OraclePool, schema: str) -> set:
-    # Filter out recycle-bin tables (BIN$...) and nested-table / IOT overflow
-    # artifacts that appear in all_tables but aren't real user tables.
+def get_oracle_tables(orapool, schema):
     rows = orapool.query_all(
         """
         SELECT table_name
@@ -155,53 +153,22 @@ def get_oracle_tables(orapool: OraclePool, schema: str) -> set:
         """,
         {"owner": schema.upper()},
     )
-    tables = {r[0] for r in rows}
+    tables = sorted(r[0] for r in rows)
     log.info("Oracle schema %s: %d tables found", schema, len(tables))
-    return tables
-
-
-def get_postgres_tables(pgpool: PostgresPool, schema: str) -> set:
-    """
-    Use pg_class directly instead of information_schema.tables.
-
-    information_schema.tables is filtered by table privileges -- a table the
-    connecting role has no grants on will be invisible, which causes false
-    "Missing in Postgres" reports. pg_class returns every relation in the
-    schema regardless of grants.
-
-    relkind values included:
-        'r' ordinary table
-        'p' partitioned table  (parent of a partitioned table; the rows live
-            in the children but COUNT(*) on the parent rolls them up)
-        'f' foreign table      (counted via the foreign data wrapper)
-    """
-    rows = pgpool.query_all(
-        """
-        SELECT c.relname
-        FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = %s
-          AND c.relkind IN ('r', 'p', 'f')
-          AND c.relname NOT LIKE 'pg_%%'
-        """,
-        (schema,),
-    )
-    tables = {r[0] for r in rows}
-    log.info("Postgres schema %s: %d tables found", schema, len(tables))
     return tables
 
 
 # ----------------------------------------------------------------------------
 # Count workers
 # ----------------------------------------------------------------------------
-# Postgres error code for "relation does not exist" -- used to flip the
-# in_postgres flag if the catalog was stale or the table truly is missing.
-PG_UNDEFINED_TABLE = "42P01"
-ORA_TABLE_OR_VIEW_NOT_EXIST = 942  # ORA-00942
+PG_UNDEFINED_TABLE = "42P01"            # relation does not exist
+PG_UNDEFINED_SCHEMA = "3F000"           # schema does not exist
+ORA_TABLE_OR_VIEW_NOT_EXIST = 942       # ORA-00942
 
 
-def count_oracle(orapool: OraclePool, result: TableResult):
-    sql = f'SELECT COUNT(*) FROM "{result.oracle_schema.upper()}"."{result.ora_table_actual}"'
+def count_oracle(orapool, result: TableResult):
+    sql = (f'SELECT COUNT(*) FROM '
+           f'"{result.oracle_schema.upper()}"."{result.ora_table_actual}"')
     t0 = time.time()
     try:
         row = orapool.query_one(sql)
@@ -226,8 +193,14 @@ def count_oracle(orapool: OraclePool, result: TableResult):
                   result.oracle_error)
 
 
-def count_postgres(pgpool: PostgresPool, result: TableResult):
-    sql = f'SELECT COUNT(*) FROM "{result.pg_schema}"."{result.pg_table_actual}"'
+def count_postgres(pgpool, result: TableResult):
+    """
+    COUNT(*) IS the existence check on the Postgres side.
+    Schema or relation missing -> set in_postgres=False (so the report
+    cleanly says "Missing in Postgres" instead of leaving an opaque error).
+    """
+    sql = (f'SELECT COUNT(*) FROM '
+           f'"{result.pg_schema}"."{result.pg_table_actual}"')
     t0 = time.time()
     try:
         row = pgpool.query_one(sql)
@@ -236,16 +209,19 @@ def count_postgres(pgpool: PostgresPool, result: TableResult):
                  result.pg_schema, result.pg_table_actual,
                  f"{result.pg_count:,}", time.time() - t0)
     except psycopg2.Error as e:
-        if getattr(e, "pgcode", None) == PG_UNDEFINED_TABLE:
-            # Table genuinely doesn't exist -- flip the flag so the report
-            # says "Missing in Postgres" instead of leaving an opaque error.
+        code = getattr(e, "pgcode", None)
+        if code in (PG_UNDEFINED_TABLE, PG_UNDEFINED_SCHEMA):
             result.in_postgres = False
-            result.pg_error = "Table not found at count time"
+            result.pg_error = ("Schema not found"
+                               if code == PG_UNDEFINED_SCHEMA
+                               else "Table not found")
+            log.warning("Postgres %s.%s missing (%s)",
+                        result.pg_schema, result.pg_table_actual, code)
         else:
             result.pg_error = str(e).splitlines()[0][:200]
-        log.error("Postgres %s.%s FAILED: %s",
-                  result.pg_schema, result.pg_table_actual,
-                  result.pg_error)
+            log.error("Postgres %s.%s FAILED: %s",
+                      result.pg_schema, result.pg_table_actual,
+                      result.pg_error)
     except Exception as e:
         result.pg_error = str(e).splitlines()[0][:200]
         log.error("Postgres %s.%s FAILED: %s",
@@ -256,56 +232,32 @@ def count_postgres(pgpool: PostgresPool, result: TableResult):
 # ----------------------------------------------------------------------------
 # Orchestration
 # ----------------------------------------------------------------------------
-def build_results_for_schema(orapool, pgpool, ora_schema, pg_schema,
-                             meta_executor):
-    f_ora = meta_executor.submit(get_oracle_tables, orapool, ora_schema)
-    f_pg = meta_executor.submit(get_postgres_tables, pgpool, pg_schema)
-    ora_tables = f_ora.result()
-    pg_tables = f_pg.result()
-
-    ora_map = {t.lower(): t for t in ora_tables}
-    pg_map = {t.lower(): t for t in pg_tables}
-    all_keys = sorted(set(ora_map) | set(pg_map))
-
-    results = []
-    for key in all_keys:
-        in_ora = key in ora_map
-        in_pg = key in pg_map
-        # Display name: prefer the Oracle-side casing when both exist.
-        display = ora_map.get(key, pg_map.get(key, key))
-        results.append(TableResult(
-            oracle_schema=ora_schema,
-            pg_schema=pg_schema,
-            table_name=display,
-            in_oracle=in_ora,
-            in_postgres=in_pg,
-            ora_table_actual=ora_map.get(key, ""),
-            pg_table_actual=pg_map.get(key, ""),
-        ))
-    return results
-
-
 def run_comparison():
     orapool = OraclePool(ORACLE_CONFIG, POOL_SIZE)
     pgpool = PostgresPool(POSTGRES_CONFIG, POOL_SIZE)
     all_results = []
 
     try:
-        # Phase 1: metadata for every schema pair, fully parallel
-        with cf.ThreadPoolExecutor(max_workers=len(SCHEMA_PAIRS) * 2 or 2,
+        # Phase 1: Oracle metadata for every schema, parallel
+        with cf.ThreadPoolExecutor(max_workers=max(len(SCHEMAS), 2),
                                    thread_name_prefix="meta") as meta_ex:
-            futs = {
-                meta_ex.submit(build_results_for_schema, orapool, pgpool,
-                               o, p, meta_ex): (o, p)
-                for o, p in SCHEMA_PAIRS
-            }
+            futs = {meta_ex.submit(get_oracle_tables, orapool, s): s
+                    for s in SCHEMAS}
             for fut in cf.as_completed(futs):
-                all_results.extend(fut.result())
+                schema = futs[fut]
+                pg_schema = pg_schema_for(schema)
+                for tname in fut.result():
+                    all_results.append(TableResult(
+                        oracle_schema=schema,
+                        pg_schema=pg_schema,
+                        table_name=tname,
+                        ora_table_actual=tname,
+                        pg_table_actual=tname.lower(),
+                    ))
 
         log.info("Total tables to process: %d", len(all_results))
 
-        # Phase 2: row counts -- two dedicated pools so Oracle and Postgres
-        # work concurrently and independently.
+        # Phase 2: counts, two independent pools running fully in parallel
         with cf.ThreadPoolExecutor(max_workers=MAX_WORKERS_PER_DB,
                                    thread_name_prefix="ora") as ora_ex, \
              cf.ThreadPoolExecutor(max_workers=MAX_WORKERS_PER_DB,
@@ -313,17 +265,16 @@ def run_comparison():
 
             futures = []
             for r in all_results:
-                if r.in_oracle:
-                    futures.append(ora_ex.submit(count_oracle, orapool, r))
-                if r.in_postgres:
-                    futures.append(pg_ex.submit(count_postgres, pgpool, r))
+                futures.append(ora_ex.submit(count_oracle, orapool, r))
+                futures.append(pg_ex.submit(count_postgres, pgpool, r))
 
             done, total = 0, len(futures)
             for fut in cf.as_completed(futures):
                 fut.result()
                 done += 1
                 if done % 25 == 0 or done == total:
-                    log.info("Progress: %d/%d count queries complete", done, total)
+                    log.info("Progress: %d/%d count queries complete",
+                             done, total)
     finally:
         orapool.close()
         pgpool.close()
@@ -353,25 +304,28 @@ def write_report(results, path):
 
     for col, h in enumerate(headers, 1):
         c = ws.cell(row=1, column=col, value=h)
-        c.fill, c.font, c.alignment, c.border = header_fill, header_font, center, thin
+        c.fill = header_fill
+        c.font = header_font
+        c.alignment = center
+        c.border = thin
 
     for i, r in enumerate(results, start=2):
         remarks = []
-        if not r.in_oracle and r.in_postgres:
-            remarks.append("Missing in Oracle")
-        elif r.in_oracle and not r.in_postgres:
+        if r.in_oracle and not r.in_postgres:
             remarks.append("Missing in Postgres")
-        elif r.in_oracle and r.in_postgres \
-                and r.oracle_count == 0 and r.pg_count == 0:
+        elif (r.in_oracle and r.in_postgres
+              and r.oracle_count == 0 and r.pg_count == 0):
             remarks.append("Both sides empty (0 rows)")
         if r.oracle_error:
             remarks.append(f"Oracle: {r.oracle_error}")
-        if r.pg_error:
+        if r.pg_error and r.in_postgres:
             remarks.append(f"Postgres: {r.pg_error}")
 
-        # Note: 0 is a valid count and must display as 0, NOT as N/A.
-        ora_val = r.oracle_count if r.in_oracle and r.oracle_count is not None else "N/A"
-        pg_val = r.pg_count if r.in_postgres and r.pg_count is not None else "N/A"
+        # 0 is a valid count -- display 0, not "N/A"
+        ora_val = (r.oracle_count if r.in_oracle and r.oracle_count is not None
+                   else "N/A")
+        pg_val = (r.pg_count if r.in_postgres and r.pg_count is not None
+                  else "N/A")
 
         row_vals = [
             r.oracle_schema, r.pg_schema, r.table_name,
@@ -402,6 +356,7 @@ def write_report(results, path):
     ws.auto_filter.ref = f"A1:H{len(results) + 1}"
     ws.freeze_panes = "A2"
 
+    # Summary sheet
     s = wb.create_sheet("Summary")
     total = len(results)
     both = sum(1 for r in results if r.exists_both == "YES")
@@ -409,16 +364,14 @@ def write_report(results, path):
     mismatched = sum(1 for r in results
                      if r.match == "NO" and r.exists_both == "YES")
     missing_pg = sum(1 for r in results if r.in_oracle and not r.in_postgres)
-    missing_ora = sum(1 for r in results if not r.in_oracle and r.in_postgres)
     errors = sum(1 for r in results if r.match == "ERROR")
     both_empty = sum(1 for r in results
                      if r.in_oracle and r.in_postgres
                      and r.oracle_count == 0 and r.pg_count == 0)
     rows = [
-        ("Total tables (union)", total),
+        ("Total Oracle tables processed", total),
         ("Exists in both", both),
-        ("Missing in Postgres only", missing_pg),
-        ("Missing in Oracle only", missing_ora),
+        ("Missing in Postgres", missing_pg),
         ("Row counts MATCH", matched),
         ("  ...of which empty on both sides", both_empty),
         ("Row counts MISMATCH", mismatched),
@@ -428,7 +381,7 @@ def write_report(results, path):
     for i, (k, v) in enumerate(rows, 1):
         s.cell(row=i, column=1, value=k).font = Font(bold=True)
         s.cell(row=i, column=2, value=v)
-    s.column_dimensions["A"].width = 32
+    s.column_dimensions["A"].width = 34
     s.column_dimensions["B"].width = 22
 
     wb.save(path)
@@ -440,8 +393,8 @@ def write_report(results, path):
 # ----------------------------------------------------------------------------
 def main():
     t0 = time.time()
-    log.info("Starting comparison for %d schema pair(s), %d workers per DB",
-             len(SCHEMA_PAIRS), MAX_WORKERS_PER_DB)
+    log.info("Starting comparison for %d schema(s), %d workers per DB",
+             len(SCHEMAS), MAX_WORKERS_PER_DB)
     results = run_comparison()
     write_report(results, OUTPUT_FILE)
 
