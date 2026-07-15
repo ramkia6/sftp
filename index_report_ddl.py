@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+"""
+Multi-threaded Oracle vs PostgreSQL (Aurora) comparison tool.
+
+Outputs:
+  * XLSX report:  Row Count Comparison | Index Comparison | Summary
+  * SQL script:   CREATE INDEX statements for indexes present in Oracle
+                  but missing in Postgres.
+
+Requirements:
+    pip install oracledb psycopg2-binary openpyxl
+"""
+
 import concurrent.futures as cf
 import logging
 import sys
@@ -228,6 +240,11 @@ def get_oracle_tables(orapool, schema):
 
 
 def get_postgres_tables(pgpool, schema):
+    # Exclude partition / inheritance children. In Postgres, declarative
+    # partitions and legacy inheritance children appear in pg_class as
+    # separate tables, but they don't have Oracle counterparts -- Oracle
+    # keeps partitions out of all_tables. Filter via pg_inherits so only
+    # top-level parent tables (partitioned or not) remain.
     rows = pgpool.query_all(
         """
         SELECT c.relname
@@ -236,6 +253,9 @@ def get_postgres_tables(pgpool, schema):
         WHERE n.nspname = %s
           AND c.relkind IN ('r', 'p', 'f')
           AND c.relname NOT LIKE 'pg_%%'
+          AND NOT EXISTS (
+              SELECT 1 FROM pg_inherits WHERE inhrelid = c.oid
+          )
         """,
         (schema,),
     )
@@ -304,6 +324,9 @@ def get_postgres_indexes(pgpool, schema):
         WHERE n.nspname = %s
           AND tc.relkind IN ('r', 'p')
           AND tc.relname NOT LIKE 'pg_%%'
+          AND NOT EXISTS (
+              SELECT 1 FROM pg_inherits WHERE inhrelid = tc.oid
+          )
         ORDER BY tc.relname, ic.relname, col.ord
         """,
         (schema,),
