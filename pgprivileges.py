@@ -15,21 +15,17 @@ Sheets produced
   6. Default Privileges       - ALTER DEFAULT PRIVILEGES entries (pg_default_acl)
   7. Effective User Privileges- per login user: direct + inherited + PUBLIC grants
 
-Usage
------
-  export PGPASSWORD='...'
-  python pg_privilege_audit.py --host mydb.cluster-xxxx.us-east-1.rds.amazonaws.com \
-                               --port 5432 --user admin --dbname appdb \
-                               --out pg_privileges.xlsx
+Usage (Windows)
+---------------
+  1. Edit the CONFIG block below - that's the only thing you need to touch.
+  2. pip install psycopg2-binary openpyxl
+  3. python pg_privilege_audit.py
 
-  # audit every database on the cluster in one workbook
-  python pg_privilege_audit.py --host ... --user admin --dbname postgres --all-databases
-
-  # also show implicit/owner-default privileges (noisier, but complete)
-  python pg_privilege_audit.py --host ... --user admin --dbname appdb --include-implicit
+Command-line flags still work and override CONFIG if you want them, e.g.
+  python pg_privilege_audit.py --all-databases
+  python pg_privilege_audit.py --host other-host --dbname otherdb
 
 Requires: psycopg2-binary, openpyxl
-    pip install psycopg2-binary openpyxl
 """
 
 from __future__ import annotations
@@ -47,6 +43,56 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
+
+# =========================================================================== #
+#                        >>>  EDIT THIS BLOCK ONLY  <<<                        #
+# =========================================================================== #
+CONFIG = {
+    # ---- connection ------------------------------------------------------- #
+    "host":     "mydb.cluster-xxxxxxxx.us-east-1.rds.amazonaws.com",
+    "port":     5432,
+    "user":     "admin",
+    "dbname":   "postgres",
+
+    # Password. Leave as None to read the PGPASSWORD environment variable, or
+    # to be prompted securely at runtime. Only hardcode it if this file is NOT
+    # going into source control (see SECURITY note at the bottom of this block).
+    "password": None,
+
+    # "require" for RDS/Aurora, "verify-full" if you supply a CA bundle below,
+    # "disable" for a local trusted instance.
+    "sslmode":  "require",
+    "sslrootcert": None,          # e.g. r"C:\certs\us-east-1-bundle.pem"
+
+    # ---- output ----------------------------------------------------------- #
+    # Folder for the .xlsx. None = same folder as this script.
+    # Use a raw string on Windows:  r"C:\Users\aditya\Desktop\audits"
+    "output_dir":  None,
+    # None = auto-name as pg_privileges_<host>_<timestamp>.xlsx
+    "output_file": None,
+
+    # ---- scope ------------------------------------------------------------ #
+    # True  = loop every connectable database on the cluster into one workbook
+    # False = just the "dbname" above
+    "all_databases":    False,
+    # True = include pg_* predefined roles and other system roles
+    "include_system":   False,
+    # True = also show implicit owner/PUBLIC defaults for objects with no
+    #        explicit GRANT (complete, but much noisier)
+    "include_implicit": False,
+
+    # Open the workbook in Excel when finished (Windows only)
+    "open_when_done": False,
+}
+# --------------------------------------------------------------------------- #
+# SECURITY: if you set "password" above, this file now contains a live
+# credential in plaintext. Do not commit it. Prefer one of:
+#     setx PGPASSWORD "yourpassword"        (persists for new shells)
+#     set  PGPASSWORD=yourpassword          (current shell only)
+# ...and leave "password": None. With None and no env var, you get a hidden
+# prompt at runtime, which is the safest option for an ad-hoc run.
+# =========================================================================== #
+
 
 # --------------------------------------------------------------------------- #
 # Styling
@@ -272,9 +318,14 @@ ORDER BY 1, 2, 3, 4, 5;
 # Helpers
 # --------------------------------------------------------------------------- #
 def role_filter(alias: str, include_system: bool) -> str:
+    """
+    Exclude only the pg_* predefined roles by default. Deliberately NOT filtering
+    on oid > 16383: that would hide the bootstrap superuser (postgres, oid 10),
+    which is the single most important role in a privilege audit.
+    """
     if include_system:
         return "true"
-    return f"{alias}.rolname NOT LIKE 'pg\\_%' AND {alias}.oid > 16383"
+    return f"{alias}.rolname NOT LIKE 'pg\\_%'"
 
 
 def fetch(cur, sql: str) -> tuple[list[str], list[tuple]]:
@@ -463,28 +514,44 @@ def audit_database(conn, dbname, include_system, include_implicit):
 # Main
 # --------------------------------------------------------------------------- #
 def main() -> int:
-    p = argparse.ArgumentParser(description="Export PostgreSQL roles, members and privileges to Excel.")
-    p.add_argument("--host", default=os.getenv("PGHOST", "localhost"))
-    p.add_argument("--port", type=int, default=int(os.getenv("PGPORT", 5432)))
-    p.add_argument("--user", default=os.getenv("PGUSER", getpass.getuser()))
-    p.add_argument("--dbname", default=os.getenv("PGDATABASE", "postgres"))
-    p.add_argument("--password", default=os.getenv("PGPASSWORD"))
-    p.add_argument("--sslmode", default=os.getenv("PGSSLMODE", "prefer"))
-    p.add_argument("--out", default=None, help="output .xlsx (default: pg_privileges_<host>_<ts>.xlsx)")
-    p.add_argument("--all-databases", action="store_true",
+    p = argparse.ArgumentParser(
+        description="Export PostgreSQL roles, members and privileges to Excel. "
+                    "All settings default to the CONFIG block at the top of this file.")
+    p.add_argument("--host", default=CONFIG["host"])
+    p.add_argument("--port", type=int, default=CONFIG["port"])
+    p.add_argument("--user", default=CONFIG["user"])
+    p.add_argument("--dbname", default=CONFIG["dbname"])
+    p.add_argument("--password", default=None)
+    p.add_argument("--sslmode", default=CONFIG["sslmode"])
+    p.add_argument("--out", default=None, help="full path to the output .xlsx")
+    p.add_argument("--all-databases", action="store_true", default=CONFIG["all_databases"],
                    help="loop over every connectable database; object sheets get a database column")
-    p.add_argument("--include-system", action="store_true",
+    p.add_argument("--include-system", action="store_true", default=CONFIG["include_system"],
                    help="include pg_* predefined roles and other system roles")
-    p.add_argument("--include-implicit", action="store_true",
+    p.add_argument("--include-implicit", action="store_true", default=CONFIG["include_implicit"],
                    help="also show implicit owner/PUBLIC defaults for objects with no explicit GRANT")
     args = p.parse_args()
 
-    pwd = args.password or getpass.getpass(f"Password for {args.user}@{args.host}: ")
+    # password precedence: --password > CONFIG > PGPASSWORD env > secure prompt
+    pwd = args.password or CONFIG["password"] or os.getenv("PGPASSWORD")
+    if not pwd:
+        pwd = getpass.getpass(f"Password for {args.user}@{args.host}: ")
+
     base = dict(host=args.host, port=args.port, user=args.user,
                 password=pwd, sslmode=args.sslmode, connect_timeout=15)
+    if CONFIG.get("sslrootcert"):
+        base["sslrootcert"] = CONFIG["sslrootcert"]
 
     ts = datetime.now()
-    out = args.out or f"pg_privileges_{args.host.split('.')[0]}_{ts:%Y%m%d_%H%M%S}.xlsx"
+    if args.out:
+        out = args.out
+    else:
+        fname = CONFIG["output_file"] or f"pg_privileges_{args.host.split('.')[0]}_{ts:%Y%m%d_%H%M%S}.xlsx"
+        folder = CONFIG["output_dir"] or os.path.dirname(os.path.abspath(__file__))
+        os.makedirs(folder, exist_ok=True)
+        out = os.path.join(folder, fname)
+
+    print(f"Connecting to {args.user}@{args.host}:{args.port}/{args.dbname} (sslmode={args.sslmode}) ...")
 
     # which databases?
     try:
@@ -581,9 +648,21 @@ def main() -> int:
     write_sheet(wb, "Effective User Privileges", eff_cols, eff_rows,
                 note="Per login user: direct grants + everything inherited through groups + PUBLIC. Owner rights are implicit and only shown with --include-implicit.")
 
-    wb.save(out)
+    try:
+        wb.save(out)
+    except PermissionError:
+        conn.close()
+        print(f"\nERROR: cannot write {out} - the file is open in Excel. "
+              f"Close it and re-run.", file=sys.stderr)
+        return 3
+
     conn.close()
-    print(f"\nWrote {out}  ({len(role_rows)} roles, {len(priv_rows)} grants, {len(eff_rows)} effective rows)")
+    print(f"\nWrote {out}")
+    print(f"  {len(role_rows)} roles ({n_groups} groups / {n_users} users), "
+          f"{len(priv_rows)} explicit grants, {len(eff_rows)} effective privilege rows")
+
+    if CONFIG.get("open_when_done") and os.name == "nt":
+        os.startfile(out)  # noqa: S606  (Windows only)
     return 0
 
 
