@@ -134,10 +134,16 @@ class Spec:
     name: str                       # category / sheet name
     key_cols: List[str]             # columns forming the identity of a row
     attr_cols: List[str]            # columns compared as attributes
-    sql: str                        # must bind :owner
+    sql: str                        # must bind :owner; may contain the {OPT} marker
     row_filter: Optional[Callable[[Dict[str, Any]], bool]] = None
     postprocess: Optional[Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]]] = None
     enabled: bool = True
+    # Dictionary view this spec reads, used to probe which optional columns exist.
+    view: Optional[str] = None
+    # {ATTR_NAME: select_expression} for columns that only exist on some Oracle
+    # versions. Injected at the {OPT} marker when present on BOTH databases,
+    # and dropped from attr_cols otherwise.
+    optional: Dict[str, str] = field(default_factory=dict)
 
 
 OBJECT_TYPES = (
@@ -163,6 +169,9 @@ SELECT t.table_name, t.partitioned, t.temporary, t.iot_type, t.cluster_name
    AND (t.iot_type IS NULL OR t.iot_type != 'IOT_OVERFLOW')
 """
 
+# NOTE: ALL_TAB_COLUMNS has no VIRTUAL_COLUMN / HIDDEN_COLUMN; those live on
+# ALL_TAB_COLS, which is a superset of it. IDENTITY_COLUMN is 12c+ only, so it
+# is injected at {OPT} only when both databases expose it.
 SQL_COLUMNS = """
 SELECT c.table_name,
        c.column_name,
@@ -175,11 +184,11 @@ SELECT c.table_name,
        c.char_length,
        c.char_used,
        c.nullable,
-       c.data_default,
-       c.virtual_column,
-       c.identity_column
-  FROM all_tab_columns c
+       c.data_default
+       {OPT}
+  FROM all_tab_cols c
  WHERE c.owner = :owner
+   AND c.hidden_column = 'NO'
    AND c.table_name NOT LIKE 'BIN$%'
    AND EXISTS (SELECT 1 FROM all_tables t
                 WHERE t.owner = c.owner AND t.table_name = c.table_name)
@@ -302,7 +311,10 @@ def build_specs(cfg: dict) -> List[Spec]:
              ["COLUMN_ID", "DATA_TYPE", "DATA_TYPE_OWNER", "DATA_LENGTH",
               "DATA_PRECISION", "DATA_SCALE", "CHAR_LENGTH", "CHAR_USED",
               "NULLABLE", "DATA_DEFAULT", "VIRTUAL_COLUMN", "IDENTITY_COLUMN"],
-             SQL_COLUMNS),
+             SQL_COLUMNS,
+             view="ALL_TAB_COLS",
+             optional={"VIRTUAL_COLUMN": "c.virtual_column",     # 11g+
+                       "IDENTITY_COLUMN": "c.identity_column"}), # 12c+
         Spec("INDEXES", ["INDEX_NAME"],
              ["TABLE_NAME", "INDEX_TYPE", "UNIQUENESS", "PARTITIONED", "INDEX_COLUMNS"],
              SQL_INDEXES),
@@ -348,17 +360,74 @@ def make_pool(user: str, password: str, dsn: str, size: int) -> "oracledb.Connec
     )
 
 
+def probe_view_columns(pool, view: str) -> set:
+    """Return the set of columns a dictionary view actually exposes on this DB."""
+    with pool.acquire() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT column_name FROM all_tab_columns "
+            " WHERE owner = 'SYS' AND table_name = :v", v=view.upper())
+        cols = {r[0].upper() for r in cur.fetchall()}
+        cur.close()
+    if not cols:
+        LOG.warning("Could not probe %s (no rows in ALL_TAB_COLUMNS for SYS.%s). "
+                    "Optional columns will be skipped.", view, view)
+    return cols
+
+
+def resolve_optional_columns(specs: List[Spec], src_pool, tgt_pool) -> None:
+    """Inject version-specific columns into each spec's SQL, but only when BOTH
+    databases have them. Mixed versions drop the attribute on both sides rather
+    than reporting a false mismatch against a NULL."""
+    probed: Dict[str, Tuple[set, set]] = {}
+    for spec in specs:
+        if spec.view and spec.optional and spec.view not in probed:
+            probed[spec.view] = (probe_view_columns(src_pool, spec.view),
+                                 probe_view_columns(tgt_pool, spec.view))
+
+    for spec in specs:
+        if "{OPT}" not in spec.sql:
+            continue
+        src_cols, tgt_cols = probed.get(spec.view, (set(), set()))
+        available, dropped = [], []
+        for attr, expr in spec.optional.items():
+            # An empty probe means "unknown" -> keep the column and let the DB decide.
+            ok_src = attr in src_cols or not src_cols
+            ok_tgt = attr in tgt_cols or not tgt_cols
+            (available if (ok_src and ok_tgt) else dropped).append(attr)
+
+        spec.sql = spec.sql.replace(
+            "{OPT}", "".join(f",\n       {spec.optional[a]}" for a in available))
+        if dropped:
+            spec.attr_cols = [a for a in spec.attr_cols if a not in dropped]
+            LOG.warning("[%s] not available on both databases, skipping: %s",
+                        spec.name, ", ".join(dropped))
+
+
+def db_banner(pool, side: str) -> str:
+    with pool.acquire() as conn:
+        ver = conn.version
+    LOG.info("[%s] Oracle version %s", side, ver)
+    return ver
+
+
 def fetch(pool, spec: Spec, owner: str, side: str) -> Dict[Tuple, Dict[str, Any]]:
     """Run one extraction query and return {key_tuple: {attr: value}}."""
     t0 = time.time()
-    with pool.acquire() as conn:
-        cur = conn.cursor()
-        cur.arraysize = 5000
-        cur.prefetchrows = 5000
-        cur.execute(spec.sql, owner=owner.upper())
-        cols = [d[0].upper() for d in cur.description]
-        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
-        cur.close()
+    try:
+        with pool.acquire() as conn:
+            cur = conn.cursor()
+            cur.arraysize = 5000
+            cur.prefetchrows = 5000
+            cur.execute(spec.sql, owner=owner.upper())
+            cols = [d[0].upper() for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+            cur.close()
+    except oracledb.DatabaseError as e:
+        LOG.error("Query failed: category=%s side=%s schema=%s\n"
+                  "--- SQL ---\n%s\n-----------", spec.name, side, owner, spec.sql)
+        raise RuntimeError(
+            f"{spec.name} extraction failed on {side} schema {owner}: {e}") from e
 
     if spec.row_filter:
         rows = [r for r in rows if spec.row_filter(r)]
@@ -579,6 +648,10 @@ def main(cfg: dict = CONFIG) -> int:
     tgt_pool = make_pool(tgt_cfg["user"], tgt_pwd, tgt_cfg["dsn"], threads)
 
     try:
+        db_banner(src_pool, "SRC")
+        db_banner(tgt_pool, "TGT")
+        resolve_optional_columns(specs, src_pool, tgt_pool)
+
         # --- parallel metadata harvest -------------------------------------- #
         harvest: Dict[Tuple[str, str, str], Any] = {}
         with ThreadPoolExecutor(max_workers=threads) as ex:
