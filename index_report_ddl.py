@@ -719,6 +719,10 @@ def get_oracle_triggers(orapool, schema):
 
 
 def get_postgres_triggers(pgpool, schema):
+    # Exclude triggers on partition / inheritance children. When a trigger is
+    # created on a partitioned parent, PG replicates it onto every child, so
+    # each child shows up as a duplicate row in pg_trigger. Filter children
+    # via pg_inherits so only the parent-level trigger remains.
     rows = pgpool.query_all(
         """
         SELECT t.tgname, c.relname
@@ -727,6 +731,7 @@ def get_postgres_triggers(pgpool, schema):
         JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname = %s
           AND NOT t.tgisinternal
+          AND NOT EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid = c.oid)
         """,
         (schema,),
     )
