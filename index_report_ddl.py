@@ -9,7 +9,7 @@ Comprehensive comparison per schema pair:
   * Views, Materialized Views
   * Procedures & Functions (with cross-kind matching -- Oracle PROCEDURE
     frequently migrates to a Postgres FUNCTION)
-  * Triggers, Sequences
+  * Triggers, Sequences 07212026
 
 Outputs:
   * db_comparison_report.xlsx  -- multi-sheet report
