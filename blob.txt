@@ -1,0 +1,1 @@
+I have oracle tables with multiple blob columns. migrating to postgres aurtora using aws dms. max blob column size is 14 mb. I'm using limited lob mode with 20MB. but dbms copy is exteremly slow. Where Can I Optimise this. Taking couple of days to copy 2 million rows
