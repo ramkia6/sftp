@@ -884,7 +884,11 @@ def compare_columns_for_pair(ora_schema, pg_schema, common_tables,
                     oc.data_type_raw, oc.precision, oc.scale, oc.length)
                 rows.append(ColumnRow(
                     oracle_schema=ora_schema, pg_schema=pg_schema,
-                    table_name=pg_table, column_name=oc.column_name,
+                    table_name=pg_table,
+                    # New column doesn't exist in PG yet -- follow PG lowercase
+                    # convention so the generated ADD COLUMN matches the rest
+                    # of the schema.
+                    column_name=oc.column_name.lower(),
                     oracle_type=format_oracle_type_display(oc),
                     expected_pg_type=expected, actual_pg_type="-",
                     deviation="MISSING_IN_PG", match="NO",
@@ -924,7 +928,11 @@ def compare_columns_for_pair(ora_schema, pg_schema, common_tables,
 
             rows.append(ColumnRow(
                 oracle_schema=ora_schema, pg_schema=pg_schema,
-                table_name=pg_table, column_name=oc.column_name,
+                table_name=pg_table,
+                # Column exists in PG already -- use the actual PG name so
+                # generated ALTER statements target the right identifier
+                # regardless of Oracle's uppercase catalog convention.
+                column_name=pc.column_name,
                 oracle_type=format_oracle_type_display(oc),
                 expected_pg_type=expected, actual_pg_type=actual,
                 deviation=deviation, match=match,
