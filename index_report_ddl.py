@@ -9,7 +9,7 @@ Comprehensive comparison per schema pair:
   * Views, Materialized Views
   * Procedures & Functions (with cross-kind matching -- Oracle PROCEDURE
     frequently migrates to a Postgres FUNCTION)
-  * Triggers, Sequences 07212026
+  * Triggers, Sequences
 
 Outputs:
   * db_comparison_report.xlsx  -- multi-sheet report
@@ -76,6 +76,10 @@ COMPARE_SEQUENCES       = True
 GENERATE_MISSING_INDEX_DDL = True
 MISSING_INDEX_DDL_FILE     = "missing_indexes_postgres.sql"
 INDEX_DDL_CONCURRENTLY     = False
+
+# ---- Column-fix DDL generation ---------------------------------------------
+GENERATE_COLUMN_FIX_DDL = True
+COLUMN_FIX_DDL_FILE     = "column_fixes_postgres.sql"
 
 # ============================================================================
 # Logging
@@ -173,6 +177,8 @@ class ColumnRow:
     deviation: str        # SCT_MATCH / DEVIATION / MISSING_IN_PG / MISSING_IN_ORACLE
     match: str            # YES / NO
     remarks: str
+    ora_nullable: Optional[bool] = None
+    pg_nullable: Optional[bool] = None
 
 
 @dataclass
@@ -883,6 +889,7 @@ def compare_columns_for_pair(ora_schema, pg_schema, common_tables,
                     expected_pg_type=expected, actual_pg_type="-",
                     deviation="MISSING_IN_PG", match="NO",
                     remarks="Column missing in Postgres",
+                    ora_nullable=oc.nullable, pg_nullable=None,
                 ))
                 continue
 
@@ -895,6 +902,7 @@ def compare_columns_for_pair(ora_schema, pg_schema, common_tables,
                     actual_pg_type=actual,
                     deviation="MISSING_IN_ORACLE", match="NO",
                     remarks="Column missing in Oracle",
+                    ora_nullable=None, pg_nullable=pc.nullable,
                 ))
                 continue
 
@@ -921,6 +929,7 @@ def compare_columns_for_pair(ora_schema, pg_schema, common_tables,
                 expected_pg_type=expected, actual_pg_type=actual,
                 deviation=deviation, match=match,
                 remarks="; ".join(remarks),
+                ora_nullable=oc.nullable, pg_nullable=pc.nullable,
             ))
     return rows
 
@@ -1150,6 +1159,116 @@ def generate_missing_pg_index_ddl(bundles, path):
     log.info("Missing-index DDL written: %s (generated: %d, skipped: %d)",
              path, generated, len(skipped))
     return generated, len(skipped)
+
+
+# ============================================================================
+# Column-fix DDL generation
+# ============================================================================
+def generate_column_fix_ddl(bundles, path):
+    """Emit ALTER TABLE statements to fix Postgres column type deviations
+    from AWS SCT defaults and add columns present only in Oracle. Grouped
+    per table so a single ALTER TABLE handles all changes (one rewrite)."""
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    type_fixes = 0
+    add_cols = 0
+    pg_only = []          # (schema, table, column, actual_pg_type)
+    body = []
+
+    for b in bundles:
+        by_table_fix = defaultdict(list)
+        by_table_add = defaultdict(list)
+        for r in b.column_results:
+            if r.deviation == 'DEVIATION':
+                by_table_fix[r.table_name].append(r)
+            elif r.deviation == 'MISSING_IN_PG':
+                by_table_add[r.table_name].append(r)
+            elif r.deviation == 'MISSING_IN_ORACLE':
+                pg_only.append((b.pg_schema, r.table_name,
+                                r.column_name, r.actual_pg_type))
+
+        tables = sorted(set(by_table_fix) | set(by_table_add))
+        if not tables:
+            continue
+
+        body.append("")
+        body.append("-- ------------------------------------------------------------")
+        body.append(f"-- Oracle {b.ora_schema}  -->  Postgres {b.pg_schema}")
+        body.append("-- ------------------------------------------------------------")
+
+        for tbl in tables:
+            fixes = by_table_fix.get(tbl, [])
+            adds  = by_table_add.get(tbl, [])
+            body.append("")
+            body.append(f"-- Table: {b.pg_schema}.{tbl}")
+
+            # Per-column comments describing the reason for each change.
+            for c in fixes:
+                extra = ""
+                if c.ora_nullable is not None and c.pg_nullable is not None \
+                        and c.ora_nullable != c.pg_nullable:
+                    extra = (f"  [nullability: Oracle="
+                             f"{'Y' if c.ora_nullable else 'N'}, "
+                             f"Postgres={'Y' if c.pg_nullable else 'N'}]")
+                body.append(
+                    f"--   {c.column_name}: Oracle {c.oracle_type} "
+                    f"| Expected {c.expected_pg_type} | Actual {c.actual_pg_type}"
+                    f"{extra}")
+            for c in adds:
+                nn_hint = ""
+                if c.ora_nullable is False:
+                    nn_hint = "  [Oracle is NOT NULL; add SET NOT NULL after backfill]"
+                body.append(
+                    f"--   {c.column_name}: MISSING in Postgres "
+                    f"(Oracle {c.oracle_type} -> {c.expected_pg_type}){nn_hint}")
+
+            # Combined ALTER TABLE with type changes + adds.
+            clauses = []
+            for c in fixes:
+                clauses.append(
+                    f'    ALTER COLUMN "{c.column_name}" TYPE {c.expected_pg_type} '
+                    f'USING "{c.column_name}"::{c.expected_pg_type}')
+                type_fixes += 1
+            for c in adds:
+                clauses.append(
+                    f'    ADD COLUMN "{c.column_name}" {c.expected_pg_type}')
+                add_cols += 1
+            body.append(
+                f'ALTER TABLE "{b.pg_schema}"."{tbl}"\n'
+                + ",\n".join(clauses) + ';')
+
+    header = [
+        "-- ============================================================",
+        "-- Postgres column-type fixes (AWS SCT default mapping)",
+        f"-- Generated: {now}",
+        f"-- Type-change columns:    {type_fixes}",
+        f"-- Missing columns to add: {add_cols}",
+        f"-- Postgres-only columns:  {len(pg_only)} (listed at end)",
+        "--",
+        "-- WARNINGS:",
+        "--   * ALTER COLUMN TYPE ... USING col::newtype may FAIL if data does",
+        "--     not fit (e.g. varchar(50) target with 60-char rows, or integer",
+        "--     target with fractional numeric values).",
+        "--   * ALTER COLUMN TYPE typically rewrites the entire table -- plan",
+        "--     for downtime / locks on large tables.",
+        "--   * Missing columns are added as NULLABLE. If Oracle marks them",
+        "--     NOT NULL, backfill then SET NOT NULL separately.",
+        "-- ============================================================",
+    ]
+
+    footer = []
+    if pg_only:
+        footer.append("")
+        footer.append("-- ============================================================")
+        footer.append("-- Columns present only in Postgres (review; not auto-dropped)")
+        footer.append("-- ============================================================")
+        for sch, tbl, col, actual in pg_only:
+            footer.append(f"--   {sch}.{tbl}.{col}    ({actual})")
+
+    with open(path, "w") as f:
+        f.write("\n".join(header + body + footer) + "\n")
+    log.info("Column-fix DDL written: %s (type-changes: %d, adds: %d, pg-only: %d)",
+             path, type_fixes, add_cols, len(pg_only))
+    return type_fixes, add_cols, len(pg_only)
 
 
 # ============================================================================
@@ -1438,7 +1557,7 @@ def write_trigger_sheet(ws, results):
     if results: ws.auto_filter.ref = f"A1:I{len(results) + 1}"
 
 
-def write_summary_sheet(ws, bundles, ddl_stats):
+def write_summary_sheet(ws, bundles, ddl_stats, col_ddl_stats):
     def totals(results, cond):
         return sum(1 for r in results if cond(r))
 
@@ -1451,6 +1570,7 @@ def write_summary_sheet(ws, bundles, ddl_stats):
     trg = [r for b in bundles for r in b.trigger_results]
     sqr = [r for b in bundles for r in b.sequence_results]
     ddl_gen, ddl_skip = ddl_stats or (0, 0)
+    col_type_fix, col_add, col_pg_only = col_ddl_stats or (0, 0, 0)
 
     rows = [
         ("=== Tables ===", ""),
@@ -1513,7 +1633,13 @@ def write_summary_sheet(ws, bundles, ddl_stats):
         ("=== Missing-index DDL ===", ""),
         ("CREATE INDEX statements generated", ddl_gen),
         ("Indexes skipped (manual translation needed)", ddl_skip),
-        ("DDL file", MISSING_INDEX_DDL_FILE if GENERATE_MISSING_INDEX_DDL else "(disabled)"),
+        ("Index DDL file", MISSING_INDEX_DDL_FILE if GENERATE_MISSING_INDEX_DDL else "(disabled)"),
+        ("", ""),
+        ("=== Column-fix DDL ===", ""),
+        ("ALTER COLUMN TYPE statements", col_type_fix),
+        ("ADD COLUMN statements", col_add),
+        ("Postgres-only columns (review, not auto-dropped)", col_pg_only),
+        ("Column-fix DDL file", COLUMN_FIX_DDL_FILE if GENERATE_COLUMN_FIX_DDL else "(disabled)"),
         ("", ""),
         ("Generated at", time.strftime("%Y-%m-%d %H:%M:%S")),
     ]
@@ -1524,7 +1650,7 @@ def write_summary_sheet(ws, bundles, ddl_stats):
     ws.column_dimensions["B"].width = 24
 
 
-def write_report(bundles, ddl_stats, path):
+def write_report(bundles, ddl_stats, col_ddl_stats, path):
     wb = Workbook()
 
     ws = wb.active; ws.title = "Row Count"
@@ -1584,7 +1710,7 @@ def write_report(bundles, ddl_stats, path):
             name_label="Sequence_Name")
 
     ws = wb.create_sheet("Summary")
-    write_summary_sheet(ws, bundles, ddl_stats)
+    write_summary_sheet(ws, bundles, ddl_stats, col_ddl_stats)
     wb.save(path)
     log.info("Report written: %s", path)
 
@@ -1602,7 +1728,11 @@ def main():
     if GENERATE_MISSING_INDEX_DDL and COMPARE_INDEXES:
         ddl_stats = generate_missing_pg_index_ddl(bundles, MISSING_INDEX_DDL_FILE)
 
-    write_report(bundles, ddl_stats, OUTPUT_FILE)
+    col_ddl_stats = None
+    if GENERATE_COLUMN_FIX_DDL and COMPARE_COLUMNS:
+        col_ddl_stats = generate_column_fix_ddl(bundles, COLUMN_FIX_DDL_FILE)
+
+    write_report(bundles, ddl_stats, col_ddl_stats, OUTPUT_FILE)
 
     all_tr = [r for b in bundles for r in b.table_results]
     all_ir = [r for b in bundles for r in b.index_results]
